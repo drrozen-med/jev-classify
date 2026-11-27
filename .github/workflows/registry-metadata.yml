@@ -26,9 +26,10 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          npm view @drrozen-med/jev-classify \
-            --registry=https://npm.pkg.github.com \
-            --json > /tmp/metadata.json
+          curl -sSf \
+            -H "Authorization: Bearer $NODE_AUTH_TOKEN" \
+            -H "Accept: application/json" \
+            https://npm.pkg.github.com/@drrozen-med/jev-classify > /tmp/metadata.json
           node -e '
             const fs = require("fs");
             const raw = JSON.parse(fs.readFileSync("/tmp/metadata.json", "utf8"));
