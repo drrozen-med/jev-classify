@@ -1,6 +1,6 @@
 {
   "name": "@drrozen-med/jev-classify",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Jev (TypeSafe System One) taxonomy classification machinery: typed-choice client, stepwise tree walk, and cost telemetry.",
   "license": "UNLICENSED",
   "type": "module",

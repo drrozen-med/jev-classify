@@ -32,6 +32,12 @@ export interface ClassifierOptions {
   minConfidence?: number;
   /** Maximum levels to walk down. Default 8. */
   maxDepth?: number;
+  /**
+   * Maximum items asked in one API call. The API rejects a request whose
+   * answer would exceed its output budget ("max_tokens_exceeded"), so wide
+   * groups are split into several calls. Default 20.
+   */
+  maxItemsPerCall?: number;
   /** Model name sent to Jev. Default `jev-latest`. */
   model?: string;
   /** Per-request timeout. Default 120000 ms. */
@@ -56,6 +62,8 @@ export interface ClassifierOptions {
 
 const DEFAULT_MIN_CONFIDENCE = 0.7;
 const DEFAULT_MAX_DEPTH = 8;
+/** The API refuses a call with too many questions; keep batches modest. */
+const DEFAULT_MAX_ITEMS_PER_CALL = 20;
 /** Guards against a pathological state blob; the model does not need more. */
 const MAX_ITEM_CHARS = 4000;
 
@@ -74,6 +82,7 @@ export async function classifyItems(
 ): Promise<ClassificationResult[]> {
   const minConfidence = options.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
+  const maxItemsPerCall = Math.max(1, options.maxItemsPerCall ?? DEFAULT_MAX_ITEMS_PER_CALL);
   const model = options.model ?? "jev-latest";
   const timeoutMs = options.timeoutMs ?? 120_000;
 
@@ -106,64 +115,73 @@ export async function classifyItems(
       }
       criteria[NONE_KEY] = "NONE — the item does not belong in any of these topics";
 
-      const state = group
-        .map((p, i) => `ITEM ${i + 1} (${p.item.id}):\n${truncate(p.item.text, MAX_ITEM_CHARS)}`)
-        .join("\n\n");
+      const chunks = chunk(group, maxItemsPerCall);
+      for (const chunkItems of chunks) {
+        const state = chunkItems
+          .map((p, i) => `ITEM ${i + 1} (${p.item.id}):\n${truncate(p.item.text, MAX_ITEM_CHARS)}`)
+          .join("\n\n");
 
-      const questions: Record<string, JevQuestion> = {};
-      group.forEach((p, i) => {
-        const extra = options.contextFor?.(p.item);
-        const defaultInstruction =
-          `ITEM ${i + 1} is the item to classify. Pick the single best topic for it.` +
-          (extra ? `\nContext: ${truncate(extra, 1500)}` : "") +
-          `\nOptions:\n${Object.entries(criteria)
-            .map(([k, v]) => `- ${k}: ${v}`)
-            .join("\n")}`;
-        questions[`i${i}`] = {
-          type: "choice",
-          instructions: options.instructionsFor
-            ? options.instructionsFor(p.item, groupPath)
-            : defaultInstruction,
-          criteria,
-        };
-      });
+        const questions: Record<string, JevQuestion> = {};
+        chunkItems.forEach((p, i) => {
+          const extra = options.contextFor?.(p.item);
+          const defaultInstruction =
+            `ITEM ${i + 1} is the item to classify. Pick the single best topic for it.` +
+            (extra ? `\nContext: ${truncate(extra, 1500)}` : "") +
+            `\nOptions:\n${Object.entries(criteria)
+              .map(([k, v]) => `- ${k}: ${v}`)
+              .join("\n")}`;
+          questions[`i${i}`] = {
+            type: "choice",
+            instructions: options.instructionsFor
+              ? options.instructionsFor(p.item, groupPath)
+              : defaultInstruction,
+            criteria,
+          };
+        });
 
-      const started = Date.now();
-      try {
-        const res = await options.client.systemOne(state, questions, { model, timeoutMs });
-        const durationMs = Date.now() - started;
-        const answers = res.answers as unknown as Record<string, JevChoiceAnswer>;
-        const outputChars = JSON.stringify(res.answers ?? {}).length;
-        options.tracker?.recordCall({
-          questions: group.length,
-          inputChars: state.length + Object.values(questions).reduce((a, q) => a + q.instructions.length, 0),
-          outputChars,
-          inputTokens: res.usage?.input_tokens ?? null,
-          outputTokens: res.usage?.output_tokens ?? null,
-          durationMs,
-          outcome: "ok",
-        });
-        options.onCall?.({ group: groupPath, questions: group.length, durationMs, outcome: "ok" });
+        const started = Date.now();
+        try {
+          const res = await options.client.systemOne(state, questions, { model, timeoutMs });
+          const durationMs = Date.now() - started;
+          const answers = res.answers as unknown as Record<string, JevChoiceAnswer>;
+          const outputChars = JSON.stringify(res.answers ?? {}).length;
+          options.tracker?.recordCall({
+            questions: chunkItems.length,
+            inputChars: state.length + Object.values(questions).reduce((a, q) => a + q.instructions.length, 0),
+            outputChars,
+            inputTokens: res.usage?.input_tokens ?? null,
+            outputTokens: res.usage?.output_tokens ?? null,
+            durationMs,
+            outcome: "ok",
+          });
+          options.onCall?.({ group: groupPath, questions: chunkItems.length, durationMs, outcome: "ok" });
 
-        group.forEach((p, i) => {
-          const answer = answers[`i${i}`];
-          applyPick(p, answer, options.tree, minConfidence, criteria);
-        });
-      } catch (error) {
-        const durationMs = Date.now() - started;
-        const message = error instanceof Error ? error.message : String(error);
-        options.tracker?.recordCall({
-          questions: group.length,
-          inputChars: state.length,
-          outputChars: 0,
-          durationMs,
-          outcome: "error",
-          error: message,
-        });
-        options.onCall?.({ group: groupPath, questions: group.length, durationMs, outcome: "error", error: message });
-        for (const p of group) {
-          p.done = true;
-          p.result = result(p, null, "unclassified", "the classification request failed");
+          chunkItems.forEach((p, i) => {
+            const answer = answers[`i${i}`];
+            applyPick(p, answer, options.tree, minConfidence, criteria);
+          });
+        } catch (error) {
+          const durationMs = Date.now() - started;
+          const message = error instanceof Error ? error.message : String(error);
+          options.tracker?.recordCall({
+            questions: chunkItems.length,
+            inputChars: state.length,
+            outputChars: 0,
+            durationMs,
+            outcome: "error",
+            error: message,
+          });
+          options.onCall?.({
+            group: groupPath,
+            questions: chunkItems.length,
+            durationMs,
+            outcome: "error",
+            error: message,
+          });
+          for (const p of chunkItems) {
+            p.done = true;
+            p.result = result(p, null, "unclassified", "the classification request failed");
+          }
         }
       }
     }
@@ -252,6 +270,13 @@ function result(
     reason,
     ...(p.item.metadata ? { metadata: p.item.metadata } : {}),
   };
+}
+
+/** Split a group into batches the API will accept. */
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
 
 function truncate(text: string, max: number): string {

@@ -15,9 +15,10 @@ const topics: TopicNode[] = [
 ];
 
 type AnswerPlan = Record<string, { choice: string; confidence: number }>;
+/** "all" answers every question of that call that has no explicit script. */
 
 /** A fake client that answers with a scripted plan per call, in call order. */
-function fakeClient(plans: AnswerPlan[]): {
+function fakeClient(plans: AnswerPlan[], defaultChoice?: { choice: string; confidence: number }): {
   client: JevClient;
   calls: Array<{ state: string; questions: Record<string, JevQuestion> }>;
 } {
@@ -30,7 +31,7 @@ function fakeClient(plans: AnswerPlan[]): {
       index += 1;
       const answers: Record<string, JevAnswer> = {};
       for (const key of Object.keys(questions)) {
-        const scripted = plan[key];
+        const scripted = plan[key] ?? (plan.all as { choice: string; confidence: number } | undefined) ?? defaultChoice;
         answers[key] = scripted
           ? { type: "choice", choice: scripted.choice, confidence: scripted.confidence, probabilities: {} }
           : { type: "choice", choice: NONE_KEY, confidence: 0.1, probabilities: {} };
@@ -131,4 +132,24 @@ test("a choice outside the offered options is refused", async () => {
   const results = await classifyItems([{ id: "m1", text: "invented branch" }], { tree, client });
   assert.equal(results[0]!.path, null);
   assert.equal(results[0]!.status, "needs_review");
+});
+
+test("wide groups are split into batches the API will accept", async () => {
+  const tree = buildTree(topics);
+  const { client, calls } = fakeClient([
+    { all: { choice: "aba.airway", confidence: 0.9 } },
+    { all: { choice: "aba.airway", confidence: 0.9 } },
+    { all: { choice: "aba.airway", confidence: 0.9 } },
+    { all: { choice: "aba.airway.emergency-airway", confidence: 0.9 } },
+    { all: { choice: "aba.airway.emergency-airway", confidence: 0.9 } },
+    { all: { choice: "aba.airway.emergency-airway", confidence: 0.9 } },
+  ]);
+  const items = Array.from({ length: 45 }, (_, i) => ({ id: `m${i}`, text: `item ${i}` }));
+  const results = await classifyItems(items, { tree, client, maxItemsPerCall: 20 });
+  // Level 1: 45 items → 3 calls of 20/20/5. Level 2: 3 calls of 20/20/5.
+  assert.equal(calls.length, 6);
+  assert.equal(Object.keys(calls[0]!.questions).length, 20);
+  assert.equal(Object.keys(calls[2]!.questions).length, 5);
+  assert.equal(results.length, 45);
+  assert.equal(results.filter((r) => r.status === "accepted").length, 45);
 });
