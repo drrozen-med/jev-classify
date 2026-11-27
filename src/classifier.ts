@@ -38,6 +38,10 @@ export interface ClassifierOptions {
    * groups are split into several calls. Default 20.
    */
   maxItemsPerCall?: number;
+  /** Retries per chunk on a transient failure. Default 2. */
+  maxRetries?: number;
+  /** Delay between retries. Default 1000 ms. */
+  retryDelayMs?: number;
   /** Model name sent to Jev. Default `jev-latest`. */
   model?: string;
   /** Per-request timeout. Default 120000 ms. */
@@ -64,6 +68,8 @@ const DEFAULT_MIN_CONFIDENCE = 0.7;
 const DEFAULT_MAX_DEPTH = 8;
 /** The API refuses a call with too many questions; keep batches modest. */
 const DEFAULT_MAX_ITEMS_PER_CALL = 20;
+const DEFAULT_MAX_RETRIES = 2;
+const DEFAULT_RETRY_DELAY_MS = 1000;
 /** Guards against a pathological state blob; the model does not need more. */
 const MAX_ITEM_CHARS = 4000;
 
@@ -83,6 +89,8 @@ export async function classifyItems(
   const minConfidence = options.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
   const maxItemsPerCall = Math.max(1, options.maxItemsPerCall ?? DEFAULT_MAX_ITEMS_PER_CALL);
+  const maxRetries = Math.max(0, options.maxRetries ?? DEFAULT_MAX_RETRIES);
+  const retryDelayMs = Math.max(0, options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS);
   const model = options.model ?? "jev-latest";
   const timeoutMs = options.timeoutMs ?? 120_000;
 
@@ -139,50 +147,19 @@ export async function classifyItems(
           };
         });
 
-        const started = Date.now();
-        try {
-          const res = await options.client.systemOne(state, questions, { model, timeoutMs });
-          const durationMs = Date.now() - started;
-          const answers = res.answers as unknown as Record<string, JevChoiceAnswer>;
-          const outputChars = JSON.stringify(res.answers ?? {}).length;
-          options.tracker?.recordCall({
-            questions: chunkItems.length,
-            inputChars: state.length + Object.values(questions).reduce((a, q) => a + q.instructions.length, 0),
-            outputChars,
-            inputTokens: res.usage?.input_tokens ?? null,
-            outputTokens: res.usage?.output_tokens ?? null,
-            durationMs,
-            outcome: "ok",
-          });
-          options.onCall?.({ group: groupPath, questions: chunkItems.length, durationMs, outcome: "ok" });
-
-          chunkItems.forEach((p, i) => {
-            const answer = answers[`i${i}`];
-            applyPick(p, answer, options.tree, minConfidence, criteria);
-          });
-        } catch (error) {
-          const durationMs = Date.now() - started;
-          const message = error instanceof Error ? error.message : String(error);
-          options.tracker?.recordCall({
-            questions: chunkItems.length,
-            inputChars: state.length,
-            outputChars: 0,
-            durationMs,
-            outcome: "error",
-            error: message,
-          });
-          options.onCall?.({
-            group: groupPath,
-            questions: chunkItems.length,
-            durationMs,
-            outcome: "error",
-            error: message,
-          });
-          for (const p of chunkItems) {
-            p.done = true;
-            p.result = result(p, null, "unclassified", "the classification request failed");
-          }
-        }
+        await runChunk({
+          chunkItems,
+          groupPath,
+          state,
+          questions,
+          options,
+          minConfidence,
+          criteria,
+          model,
+          timeoutMs,
+          maxRetries,
+          retryDelayMs,
+        });
       }
     }
     level += 1;
@@ -202,6 +179,91 @@ export async function classifyItems(
   }
 
   return pending.map((p) => p.result ?? result(p, null, "unclassified", "no result"));
+}
+
+/**
+ * Run one chunk of items, retrying transient failures and halving the chunk
+ * when the API says the request was too big. Items are only given up on when
+ * every attempt failed — a failed call never silently loses content.
+ */
+async function runChunk(args: {
+  chunkItems: Pending[];
+  groupPath: string;
+  state: string;
+  questions: Record<string, JevQuestion>;
+  options: ClassifierOptions;
+  minConfidence: number;
+  criteria: Record<string, string>;
+  model: string;
+  timeoutMs: number;
+  maxRetries: number;
+  retryDelayMs: number;
+}): Promise<void> {
+  const {
+    chunkItems,
+    groupPath,
+    state,
+    questions,
+    options,
+    minConfidence,
+    criteria,
+    model,
+    timeoutMs,
+    maxRetries,
+    retryDelayMs,
+  } = args;
+
+  let attempt = 0;
+  let lastError = "";
+  while (attempt <= maxRetries) {
+    const started = Date.now();
+    try {
+      const res = await options.client.systemOne(state, questions, { model, timeoutMs });
+      const durationMs = Date.now() - started;
+      const answers = res.answers as unknown as Record<string, JevChoiceAnswer>;
+      const outputChars = JSON.stringify(res.answers ?? {}).length;
+      options.tracker?.recordCall({
+        questions: chunkItems.length,
+        inputChars: state.length + Object.values(questions).reduce((a, q) => a + q.instructions.length, 0),
+        outputChars,
+        inputTokens: res.usage?.input_tokens ?? null,
+        outputTokens: res.usage?.output_tokens ?? null,
+        durationMs,
+        outcome: "ok",
+      });
+      options.onCall?.({ group: groupPath, questions: chunkItems.length, durationMs, outcome: "ok" });
+      chunkItems.forEach((p, i) => {
+        applyPick(p, answers[`i${i}`], options.tree, minConfidence, criteria);
+      });
+      return;
+    } catch (error) {
+      const durationMs = Date.now() - started;
+      lastError = error instanceof Error ? error.message : String(error);
+      options.tracker?.recordCall({
+        questions: chunkItems.length,
+        inputChars: state.length,
+        outputChars: 0,
+        durationMs,
+        outcome: "error",
+        error: lastError,
+      });
+      options.onCall?.({
+        group: groupPath,
+        questions: chunkItems.length,
+        durationMs,
+        outcome: "error",
+        error: lastError,
+      });
+      attempt += 1;
+      if (attempt <= maxRetries && retryDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+    }
+  }
+  for (const p of chunkItems) {
+    p.done = true;
+    p.result = result(p, null, "unclassified", `the classification request failed: ${lastError}`);
+  }
 }
 
 function applyPick(

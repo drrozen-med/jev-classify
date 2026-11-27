@@ -153,3 +153,51 @@ test("wide groups are split into batches the API will accept", async () => {
   assert.equal(results.length, 45);
   assert.equal(results.filter((r) => r.status === "accepted").length, 45);
 });
+
+test("a transient failure is retried before the item is given up on", async () => {
+  const tree = buildTree(topics);
+  let calls = 0;
+  const client: JevClient = {
+    systemOne: async (): Promise<JevResponse> => {
+      calls += 1;
+      if (calls < 3) throw new Error("fetch failed");
+      const choice = calls === 3 ? "aba.vascular" : "aba.vascular.thoracic-aortic-surgery";
+      return {
+        model: "jev-latest",
+        answers: {
+          i0: { type: "choice", choice, confidence: 0.9, probabilities: {} },
+        },
+      };
+    },
+  };
+  const results = await classifyItems([{ id: "m1", text: "vascular case" }], {
+    tree,
+    client,
+    maxRetries: 2,
+    retryDelayMs: 0,
+  });
+  // Two failures, then level 1 succeeds, then the walk continues one level down.
+  assert.equal(calls, 4);
+  assert.equal(results[0]!.path, "aba.vascular.thoracic-aortic-surgery");
+  assert.equal(results[0]!.status, "accepted");
+});
+
+test("an item is only given up on after every attempt failed", async () => {
+  const tree = buildTree(topics);
+  let calls = 0;
+  const client: JevClient = {
+    systemOne: async (): Promise<JevResponse> => {
+      calls += 1;
+      throw new Error("fetch failed");
+    },
+  };
+  const results = await classifyItems([{ id: "m1", text: "anything" }], {
+    tree,
+    client,
+    maxRetries: 2,
+    retryDelayMs: 0,
+  });
+  assert.equal(calls, 3);
+  assert.equal(results[0]!.status, "unclassified");
+  assert.match(results[0]!.reason, /fetch failed/);
+});
