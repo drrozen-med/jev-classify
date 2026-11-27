@@ -1,14 +1,15 @@
 {
   "name": "@drrozen-med/jev-classify",
-  "latest": "0.2.0",
+  "latest": "0.3.0",
   "versions": [
     "0.1.0",
-    "0.2.0"
+    "0.2.0",
+    "0.3.0"
   ],
   "dist": {
-    "version": "0.2.0",
-    "tarball": "https://npm.pkg.github.com/download/@drrozen-med/jev-classify/0.2.0/99ee7a228c22d318711b63889eeca9b0d33f0431",
-    "integrity": "sha512-6kz0PwhopQNlBvMr1/wGCGwtcck9IzdnvMKCizTnHoFx/+/sWu1EW8eqPQEos2KYM7liXUxucRBN1S9XAEtBCA==",
-    "shasum": "99ee7a228c22d318711b63889eeca9b0d33f0431"
+    "version": "0.3.0",
+    "tarball": "https://npm.pkg.github.com/download/@drrozen-med/jev-classify/0.3.0/01c381dc642ebc9ed83182b14adde7c5ce178b33",
+    "integrity": "sha512-b7iz1gvfaH5ahj29ZUh5LBuOa57CZAxCDmX1Qf3wpQkw06w8hWaIy5UhNrjKl/UwuUyqiQ0YcbxOLSPXBNNRZg==",
+    "shasum": "01c381dc642ebc9ed83182b14adde7c5ce178b33"
   }
 }
